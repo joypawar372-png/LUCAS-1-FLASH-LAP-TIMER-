@@ -1,3 +1,6 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -5,32 +8,431 @@
 #include <VL53L1X.h>
 #include <VL53L0X.h>
 
-// --- PIN DEFINITIONS ---
-#define TOUCH_PIN    4
-#define TRIG_PIN     5
-#define ECHO_PIN     18
-#define RED_LED      14
-#define GREEN_LED    27
-#define BUZZER_PIN   19
+// ==========================================
+// PIN CONFIGURATIONS
+// ==========================================
+#define TOUCH_PIN     4
+#define TRIG_PIN      5
+#define ECHO_PIN      18
+#define RED_LED       14
+#define GREEN_LED     27
+#define BUZZER_PIN    19
 
-#define TOF_SDA      32
-#define TOF_SCL      33
-#define TOF_XSHUT    26
-#define MAX_DIST_CM  200
+#define TOF_SDA       32
+#define TOF_SCL       33
+#define TOF_XSHUT     26
 
-// --- HARDWARE OBJECTS ---
-NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DIST_CM);
+#define OLED_SDA      21
+#define OLED_SCL      22
+#define OLED_ADDR     0x3D // Fallback to 0x3C in code if needed
+
+// ==========================================
+// CONSTANTS & SENSOR TUNING
+// ==========================================
+#define MAX_SONAR_DIST_CM   400 // Pushed to HC-SR04 operational limit
+#define JITTER_DEADBAND_CM  4   // 3-4 cm measurement noise rejection
+#define BEAM_CUT_DELTA_CM   25  // Sudden distance drop indicating a skater
+#define BEAM_CUT_MIN_CM     8   // Ignore readings closer than 8cm (sensor blindspot)
+#define LOCKOUT_WINDOW_MS   2500 // Avoid double triggers from hands/feet/skates
+#define MAX_STORED_LAPS     10
+
+// ==========================================
+// HARDWARE OBJECTS
+// ==========================================
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_SONAR_DIST_CM);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 VL53L1X tof1;
 VL53L0X tof0;
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
 
-// --- STATE VARIABLES ---
-bool systemEnabled = false;
-unsigned long touchHoldStart = 0;
+// ==========================================
+// SYSTEM STATE ENUMS & VARIABLES
+// ==========================================
+enum SystemState {
+  STATE_STANDBY,
+  STATE_PAST_LAPS,
+  STATE_COUNTDOWN,
+  STATE_WAIT_START,
+  STATE_TIMING,
+  STATE_LAP_FINISHED
+};
+
+SystemState currentState = STATE_STANDBY;
+
+// Sensor detection flags
 bool isVL53L1X = false;
 bool isVL53L0X = false;
 bool tofReady = false;
 
+// Calibration variables
+int baselineSonarCm = 0;
+int baselineTofCm = 0;
+
+// High-precision timing
+int64_t raceStartMicros = 0;
+int64_t raceEndMicros = 0;
+double currentLapSeconds = 0.0;
+unsigned long stateTimerMillis = 0;
+unsigned long lastTriggerTimeMillis = 0;
+
+// Touch detection variables
+unsigned long touchPressStartTime = 0;
+unsigned long lastTapReleaseTime = 0;
+int tapCount = 0;
+bool touchWasPressed = false;
+
+// Laps memory
+double lapHistory[MAX_STORED_LAPS];
+int totalLapsRecorded = 0;
+
+// Web remote trigger flag
+volatile bool remoteCountdownTriggered = false;
+
+// Tone generator helper
+void playTone(unsigned int freq, unsigned long durationMs) {
+  tone(BUZZER_PIN, freq, durationMs);
+  delay(durationMs);
+  noTone(BUZZER_PIN);
+}
+
+// 5-beep sequence on lap completion
+void playFinishBeeps() {
+  for (int i = 0; i < 5; i++) {
+    tone(BUZZER_PIN, 2600);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+    delay(70);
+    noTone(BUZZER_PIN);
+    digitalWrite(GREEN_LED, LOW);
+    delay(50);
+  }
+}
+
+// ==========================================
+// HARDWARE SENSOR CALIBRATION & READING
+// ==========================================
+void calibrateBaselines() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(5, 20);
+  display.print("Calibrating Track...");
+  display.setCursor(5, 40);
+  display.print("Clear Finish Line");
+  display.display();
+
+  long sonarSum = 0;
+  long tofSum = 0;
+  int validSonarSamples = 0;
+  int validTofSamples = 0;
+
+  for (int i = 0; i < 15; i++) {
+    int s = sonar.ping_cm();
+    if (s > 0) {
+      sonarSum += s;
+      validSonarSamples++;
+    }
+
+    int t = 0;
+    if (isVL53L1X && tof1.dataReady()) {
+      t = tof1.read() / 10;
+    } else if (isVL53L0X) {
+      t = tof0.readRangeContinuousMillimeters() / 10;
+    }
+    if (t > 0 && t < 400) {
+      tofSum += t;
+      validTofSamples++;
+    }
+    delay(50);
+  }
+
+  baselineSonarCm = (validSonarSamples > 0) ? (sonarSum / validSonarSamples) : 300;
+  baselineTofCm = (validTofSamples > 0) ? (tofSum / validTofSamples) : 200;
+
+  Serial.printf("[CALIBRATION] Baseline Sonar: %d cm, Baseline ToF: %d cm\n", baselineSonarCm, baselineTofCm);
+}
+
+bool checkBeamCut(int &outSonar, int &outTof) {
+  // 1. Read Ultrasonic
+  outSonar = sonar.ping_cm();
+  
+  // 2. Read Time-of-Flight
+  outTof = 0;
+  if (isVL53L1X && tof1.dataReady()) {
+    outTof = tof1.read() / 10;
+  } else if (isVL53L0X) {
+    outTof = tof0.readRangeContinuousMillimeters() / 10;
+  }
+
+  // Deadband jitter filter & large dynamic variation detection
+  bool sonarCut = false;
+  if (outSonar >= BEAM_CUT_MIN_CM && outSonar < (baselineSonarCm - BEAM_CUT_DELTA_CM)) {
+    if (abs(outSonar - baselineSonarCm) > JITTER_DEADBAND_CM) {
+      sonarCut = true;
+    }
+  }
+
+  bool tofCut = false;
+  if (tofReady && outTof >= BEAM_CUT_MIN_CM && outTof < (baselineTofCm - BEAM_CUT_DELTA_CM)) {
+    if (abs(outTof - baselineTofCm) > JITTER_DEADBAND_CM) {
+      tofCut = true;
+    }
+  }
+
+  return (sonarCut || tofCut);
+}
+
+// ==========================================
+// WEB UI (HTML / CSS / JS)
+// ==========================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BRAVO X1 Telemetry</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card: #131b2e;
+      --accent: #00f0ff;
+      --warn: #ff0055;
+      --text: #ffffff;
+      --sub: #788ca0;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .header {
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: 2px;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .subhead {
+      font-size: 12px;
+      color: var(--sub);
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid #223254;
+      border-radius: 14px;
+      width: 100%;
+      max-width: 420px;
+      padding: 20px;
+      box-sizing: border-box;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+      margin-bottom: 16px;
+      text-align: center;
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      border-radius: 20px;
+      background: #1a2942;
+      color: var(--accent);
+      margin-bottom: 15px;
+    }
+    .timer-val {
+      font-size: 54px;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      margin: 10px 0;
+      color: #fff;
+      text-shadow: 0 0 20px rgba(0,240,255,0.4);
+    }
+    .btn {
+      background: var(--accent);
+      color: #000;
+      font-size: 18px;
+      font-weight: 700;
+      border: none;
+      border-radius: 10px;
+      padding: 16px 24px;
+      width: 100%;
+      cursor: pointer;
+      box-shadow: 0 4px 15px rgba(0,240,255,0.3);
+      transition: transform 0.1s;
+    }
+    .btn:active {
+      transform: scale(0.97);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 8px 12px;
+      text-align: left;
+      border-bottom: 1px solid #1c2842;
+    }
+    th { color: var(--sub); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="header">BRAVO X1</div>
+  <div class="subhead">Lucas Lap Timing System</div>
+
+  <div class="card">
+    <div id="statusBadge" class="status-badge">STANDBY</div>
+    <div id="liveTimer" class="timer-val">00.000</div>
+    <button id="triggerBtn" class="btn" onclick="startRemoteCountdown()">REMOTE 3-2-1 START</button>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:700; font-size:16px; text-align:left; margin-bottom:10px;">Past Lap Logs</div>
+    <table>
+      <thead><tr><th>Lap</th><th>Duration</th></tr></thead>
+      <tbody id="lapTableBody">
+        <tr><td colspan="2" style="color:var(--sub); text-align:center;">No completed laps yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    function playToneWeb(freq, dur) {
+      try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + dur);
+      } catch(e) {}
+    }
+
+    function startRemoteCountdown() {
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      fetch('/api/start_countdown');
+    }
+
+    const evtSource = new EventSource('/events');
+    evtSource.addEventListener('status', function(e) {
+      document.getElementById('statusBadge').innerText = e.data;
+    });
+
+    evtSource.addEventListener('timer', function(e) {
+      document.getElementById('liveTimer').innerText = e.data;
+    });
+
+    evtSource.addEventListener('web_beep', function(e) {
+      let code = e.data;
+      if (code === 'low') {
+        playToneWeb(800, 0.2);
+      } else if (code === 'high') {
+        playToneWeb(1800, 0.6);
+      } else if (code === 'rapid_finish') {
+        let count = 0;
+        let intv = setInterval(() => {
+          playToneWeb(2200, 0.08);
+          count++;
+          if(count >= 5) clearInterval(intv);
+        }, 120);
+      }
+    });
+
+    evtSource.addEventListener('laps', function(e) {
+      const data = JSON.parse(e.data);
+      const tbody = document.getElementById('lapTableBody');
+      if (data.length === 0) return;
+      tbody.innerHTML = '';
+      data.forEach((lap, idx) => {
+        let row = `<tr><td>#${idx + 1}</td><td>${lap.toFixed(3)} s</td></tr>`;
+        tbody.innerHTML += row;
+      });
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// Send Lap History as JSON via SSE
+void broadcastLapsJSON() {
+  String json = "[";
+  for (int i = 0; i < totalLapsRecorded; i++) {
+    json += String(lapHistory[i], 3);
+    if (i < totalLapsRecorded - 1) json += ",";
+  }
+  json += "]";
+  events.send(json.c_str(), "laps", millis());
+}
+
+// ==========================================
+// TOUCH BUTTON HANDLER
+// ==========================================
+void handleTouchInputs() {
+  bool isPressed = (digitalRead(TOUCH_PIN) == HIGH);
+  unsigned long now = millis();
+
+  if (isPressed && !touchWasPressed) {
+    // Touch Just Pressed
+    touchPressStartTime = now;
+    touchWasPressed = true;
+  } 
+  else if (!isPressed && touchWasPressed) {
+    // Touch Just Released
+    unsigned long pressDuration = now - touchPressStartTime;
+    touchWasPressed = false;
+
+    if (pressDuration >= 2000) {
+      // HOLD FOR 2 SECONDS CONFIRMED
+      if (currentState == STATE_STANDBY || currentState == STATE_PAST_LAPS) {
+        currentState = STATE_COUNTDOWN;
+        stateTimerMillis = now;
+        tapCount = 0;
+      }
+    } else if (pressDuration > 40 && pressDuration < 600) {
+      // Possible Tap
+      if (now - lastTapReleaseTime < 450) {
+        tapCount++;
+      } else {
+        tapCount = 1;
+      }
+      lastTapReleaseTime = now;
+    }
+  }
+
+  // Evaluate Tap Sequence
+  if (tapCount > 0 && (now - lastTapReleaseTime >= 450) && !touchWasPressed) {
+    if (tapCount == 2) {
+      // DOUBLE TAP CONFIRMED
+      if (currentState == STATE_STANDBY) {
+        currentState = STATE_PAST_LAPS;
+      } else if (currentState == STATE_PAST_LAPS) {
+        currentState = STATE_STANDBY;
+      }
+    } else if (tapCount == 1 && currentState == STATE_PAST_LAPS) {
+      currentState = STATE_STANDBY;
+    }
+    tapCount = 0;
+  }
+}
+
+// ==========================================
+// ARDUINO SETUP
+// ==========================================
 void setup() {
   Serial.begin(115200);
 
@@ -38,36 +440,37 @@ void setup() {
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  
-  // 1. Hardware Reset: Hold XSHUT low to prevent bus lockup
+  digitalWrite(RED_LED, HIGH);
+  digitalWrite(GREEN_LED, LOW);
+
+  // Hardware Reset ToF on boot
   pinMode(TOF_XSHUT, OUTPUT);
   digitalWrite(TOF_XSHUT, LOW);
 
-  // 2. Initialize OLED on Primary I2C (Pins 21/22)
-  Wire.begin(21, 22);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3D);
+  // 1. OLED Display Setup
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  }
   display.setTextColor(WHITE);
   display.clearDisplay();
-  
   display.setTextSize(2);
-  display.setCursor(15, 10);
+  display.setCursor(15, 20);
   display.print("BRAVO X1");
   display.setTextSize(1);
-  display.setCursor(18, 40);
-  display.print("Initializing...");
+  display.setCursor(20, 45);
+  display.print("Lucas Timing Sys");
   display.display();
+  delay(1200);
 
-  // 3. Hardware Wakeup: Release ToF Reset
-  delay(100);
+  // 2. ToF Power Up
   digitalWrite(TOF_XSHUT, HIGH);
   delay(150);
 
-  // 4. Initialize Secondary I2C (Pins 32/33)
+  // 3. ToF Setup on Wire1
   Wire1.begin(TOF_SDA, TOF_SCL, 400000);
-
-  // 5. Autodetect Sensor Protocol
   tof1.setBus(&Wire1);
-  tof1.setTimeout(500);
+  tof1.setTimeout(250);
   if (tof1.init()) {
     isVL53L1X = true;
     tofReady = true;
@@ -76,7 +479,7 @@ void setup() {
     tof1.startContinuous(33);
   } else {
     tof0.setBus(&Wire1);
-    tof0.setTimeout(500);
+    tof0.setTimeout(250);
     if (tof0.init()) {
       isVL53L0X = true;
       tofReady = true;
@@ -84,147 +487,322 @@ void setup() {
     }
   }
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(10, 25);
-  if (isVL53L1X) {
-    display.print("Detected: VL53L1X");
-  } else if (isVL53L0X) {
-    display.print("Detected: VL53L0X");
-  } else {
-    display.print("ToF Not Detected!");
-  }
-  display.display();
-  delay(1500);
+  // 4. Wi-Fi Access Point Initialization
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("BRAVO_X1_TIMER", "bravox1speed");
+  Serial.print("[AP READY] IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 5. Async Web Server Setup
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  server.on("/api/start_countdown", HTTP_GET, [](AsyncWebServerRequest *request){
+    remoteCountdownTriggered = true;
+    request->send(200, "text/plain", "COUNTDOWN_INITIATED");
+  });
+
+  events.onConnect([](AsyncEventSourceClient *client){
+    client->send("Connected to BRAVO X1", "status", millis());
+    broadcastLapsJSON();
+  });
+  server.addHandler(&events);
+  server.begin();
+
+  // Run dynamic track floor calibration
+  calibrateBaselines();
+
+  currentState = STATE_STANDBY;
 }
 
+// ==========================================
+// MAIN REAL-TIME LOOP
+// ==========================================
 void loop() {
-  // --- 1. TOUCH SENSOR LOGIC (2-Sec Hold) ---
-  if (digitalRead(TOUCH_PIN) == HIGH) {
-    if (touchHoldStart == 0) {
-      touchHoldStart = millis(); 
-    } else if (millis() - touchHoldStart >= 2000) {
-      systemEnabled = !systemEnabled; 
-      touchHoldStart = 0; 
-      
-      display.clearDisplay();
-      display.setTextSize(2);
-      display.setCursor(15, 25);
-      display.print(systemEnabled ? "ENABLED!" : "DISABLED");
-      display.display();
-      
-      tone(BUZZER_PIN, systemEnabled ? 2000 : 800, 300); 
-      delay(1500); 
+  unsigned long currentMillis = millis();
+  handleTouchInputs();
+
+  // Check remote web trigger
+  if (remoteCountdownTriggered) {
+    remoteCountdownTriggered = false;
+    if (currentState == STATE_STANDBY || currentState == STATE_PAST_LAPS) {
+      currentState = STATE_COUNTDOWN;
+      stateTimerMillis = currentMillis;
     }
-  } else {
-    touchHoldStart = 0; 
   }
 
-  display.clearDisplay();
+  int currentSonarCm = 0;
+  int currentTofCm = 0;
 
-  // --- 2. STANDBY SCREEN ---
-  if (!systemEnabled) {
-    digitalWrite(RED_LED, HIGH);
-    digitalWrite(GREEN_LED, LOW);
-    noTone(BUZZER_PIN);
+  // ==========================================
+  // STATE MACHINE EXECUTION
+  // ==========================================
+  switch (currentState) {
 
-    // Drain data buffers so I2C does not freeze
-    if (isVL53L1X && tof1.dataReady()) { tof1.read(); }
-    if (isVL53L0X) { tof0.readRangeContinuousMillimeters(); }
-
-    display.setTextSize(2);
-    display.setCursor(20, 10);
-    display.print("STANDBY");
-    
-    display.setTextSize(1);
-    display.setCursor(15, 35);
-    display.print("Hold Touch 2 Sec");
-    
-    if (touchHoldStart > 0) {
-      int barWidth = map(millis() - touchHoldStart, 0, 2000, 0, 128);
-      display.fillRect(0, 50, barWidth, 10, WHITE);
-    }
-  } 
-  // --- 3. ACTIVE TELEMETRY SCREEN ---
-  else {
-    digitalWrite(RED_LED, LOW);
-    digitalWrite(GREEN_LED, HIGH);
-    
-    // Acquire Sonar Distance
-    unsigned int sonarDist = sonar.ping_cm();
-    
-    // Acquire ToF Distance
-    unsigned int tofDist = 0;
-    if (isVL53L1X) {
-      if (tof1.dataReady()) {
-        tofDist = tof1.read() / 10; // Convert mm to cm
-      }
-    } else if (isVL53L0X) {
-      tofDist = tof0.readRangeContinuousMillimeters() / 10;
-    }
-
-    // Proximity trigger (under 10 cm)
-    bool objectDetected = ((sonarDist > 0 && sonarDist <= 10) || (tofDist > 0 && tofDist <= 10));
-
-    if (objectDetected) {
-      tone(BUZZER_PIN, 2500); 
+    // ----------------------------------------------------
+    // 1. STANDBY MENU
+    // ----------------------------------------------------
+    case STATE_STANDBY: {
       digitalWrite(RED_LED, HIGH);
       digitalWrite(GREEN_LED, LOW);
-    } else {
-      noTone(BUZZER_PIN); 
+      noTone(BUZZER_PIN);
+
+      // Drain ToF buffers
+      if (isVL53L1X && tof1.dataReady()) tof1.read();
+      if (isVL53L0X) tof0.readRangeContinuousMillimeters();
+
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(15, 5);
+      display.print("BRAVO X1");
+      display.drawLine(0, 24, 127, 24, WHITE);
+
+      display.setTextSize(1);
+      display.setCursor(5, 30);
+      display.print("Hold 2s : ARM TIMER");
+      display.setCursor(5, 42);
+      display.print("Dbl Tap : PAST LAPS");
+
+      // Visual hold progress bar
+      if (touchWasPressed) {
+        unsigned long held = currentMillis - touchPressStartTime;
+        int barW = map(constrain(held, 0, 2000), 0, 2000, 0, 128);
+        display.fillRect(0, 56, barW, 8, WHITE);
+      }
+      display.display();
+
+      events.send("STANDBY", "status", currentMillis);
+      break;
+    }
+
+    // ----------------------------------------------------
+    // 2. PAST LAPS HISTORY VIEW
+    // ----------------------------------------------------
+    case STATE_PAST_LAPS: {
+      digitalWrite(RED_LED, LOW);
+      digitalWrite(GREEN_LED, LOW);
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.print("PAST LAPS (Tap exit)");
+      display.drawLine(0, 10, 127, 10, WHITE);
+
+      if (totalLapsRecorded == 0) {
+        display.setCursor(10, 30);
+        display.print("No records logged.");
+      } else {
+        int displayCount = min(totalLapsRecorded, 4);
+        for (int i = 0; i < displayCount; i++) {
+          int lapIdx = totalLapsRecorded - 1 - i;
+          display.setCursor(5, 14 + (i * 12));
+          display.printf("L%d: %.3f s", lapIdx + 1, lapHistory[lapIdx]);
+        }
+      }
+      display.display();
+      events.send("VIEWING PAST LAPS", "status", currentMillis);
+      break;
+    }
+
+    // ----------------------------------------------------
+    // 3. 3-2-1 COUNTDOWN SEQUENCE
+    // ----------------------------------------------------
+    case STATE_COUNTDOWN: {
+      unsigned long elapsed = currentMillis - stateTimerMillis;
+      display.clearDisplay();
+      display.setTextSize(4);
+
+      if (elapsed < 1000) {
+        display.setCursor(50, 18);
+        display.print("3");
+        display.display();
+        digitalWrite(RED_LED, HIGH);
+        playTone(800, 100);
+        events.send("COUNTDOWN: 3", "status", currentMillis);
+        events.send("low", "web_beep", currentMillis);
+        delay(850);
+      } 
+      else if (elapsed < 2000) {
+        display.setCursor(50, 18);
+        display.print("2");
+        display.display();
+        digitalWrite(RED_LED, HIGH);
+        playTone(800, 100);
+        events.send("COUNTDOWN: 2", "status", currentMillis);
+        events.send("low", "web_beep", currentMillis);
+        delay(850);
+      } 
+      else if (elapsed < 3000) {
+        display.setCursor(50, 18);
+        display.print("1");
+        display.display();
+        digitalWrite(RED_LED, HIGH);
+        playTone(800, 100);
+        events.send("COUNTDOWN: 1", "status", currentMillis);
+        events.send("low", "web_beep", currentMillis);
+        delay(850);
+      } 
+      else {
+        display.setCursor(35, 18);
+        display.print("GO!");
+        display.display();
+        digitalWrite(RED_LED, LOW);
+        digitalWrite(GREEN_LED, HIGH);
+        playTone(1800, 400);
+        events.send("GO! SYSTEM ARMED", "status", currentMillis);
+        events.send("high", "web_beep", currentMillis);
+
+        // Transition to waiting for the initial gate crossing
+        currentState = STATE_WAIT_START;
+        lastTriggerTimeMillis = millis();
+      }
+      break;
+    }
+
+    // ----------------------------------------------------
+    // 4. ARMED: WAITING FOR FIRST LINE CROSSING
+    // ----------------------------------------------------
+    case STATE_WAIT_START: {
       digitalWrite(RED_LED, LOW);
       digitalWrite(GREEN_LED, HIGH);
+
+      bool cut = checkBeamCut(currentSonarCm, currentTofCm);
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.print("BRAVO X1 : ARMED");
+      display.drawLine(0, 10, 127, 10, WHITE);
+
+      display.setTextSize(2);
+      display.setCursor(10, 20);
+      display.print("CROSS NOW");
+
+      display.setTextSize(1);
+      display.setCursor(0, 48);
+      display.printf("S:%dcm T:%dcm", currentSonarCm, currentTofCm);
+      display.display();
+
+      events.send("WAITING FOR START CUT", "status", currentMillis);
+
+      if (cut && (currentMillis - lastTriggerTimeMillis > LOCKOUT_WINDOW_MS)) {
+        // Skater broke the beam for the first time
+        raceStartMicros = esp_timer_get_time();
+        lastTriggerTimeMillis = currentMillis;
+
+        // Start beep confirmation
+        tone(BUZZER_PIN, 2000, 120);
+
+        currentState = STATE_TIMING;
+      }
+      break;
     }
 
-    // --- DISPLAY LAYOUT ---
-    // Header
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.print("BRAVO X1");
-    display.setCursor(80, 0);
-    display.print(objectDetected ? "[ALERT]" : "[OK]");
-    display.drawLine(0, 10, 127, 10, WHITE);
+    // ----------------------------------------------------
+    // 5. TIMING ACTIVE LAP
+    // ----------------------------------------------------
+    case STATE_TIMING: {
+      int64_t liveMicros = esp_timer_get_time() - raceStartMicros;
+      currentLapSeconds = (double)liveMicros / 1000000.0;
 
-    // Row 1: Ultrasonic Reading & Progress Bar
-    display.setCursor(0, 15);
-    display.print("SONAR: ");
-    if (sonarDist > 0) {
-      display.print(sonarDist);
-      display.print(" cm");
-    } else {
-      display.print("-- (Out)");
+      bool cut = checkBeamCut(currentSonarCm, currentTofCm);
+
+      // Render Display
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.printf("LAP #%d TIMING", totalLapsRecorded + 1);
+      display.drawLine(0, 10, 127, 10, WHITE);
+
+      display.setTextSize(3);
+      display.setCursor(0, 22);
+      display.printf("%05.2f", currentLapSeconds);
+
+      display.setTextSize(1);
+      display.setCursor(100, 36);
+      display.print("sec");
+
+      display.setCursor(0, 54);
+      display.printf("Rng: S:%d T:%d", currentSonarCm, currentTofCm);
+      display.display();
+
+      // Broadcast telemetry to phone
+      char timeStr[16];
+      snprintf(timeStr, sizeof(timeStr), "%.3f s", currentLapSeconds);
+      events.send(timeStr, "timer", currentMillis);
+      events.send("RUNNING", "status", currentMillis);
+
+      // Check for Lap Completion
+      if (cut && (currentMillis - lastTriggerTimeMillis > LOCKOUT_WINDOW_MS)) {
+        raceEndMicros = esp_timer_get_time();
+        currentLapSeconds = (double)(raceEndMicros - raceStartMicros) / 1000000.0;
+        lastTriggerTimeMillis = currentMillis;
+
+        // Store lap in history (circular buffer)
+        if (totalLapsRecorded < MAX_STORED_LAPS) {
+          lapHistory[totalLapsRecorded] = currentLapSeconds;
+          totalLapsRecorded++;
+        } else {
+          for (int i = 0; i < MAX_STORED_LAPS - 1; i++) {
+            lapHistory[i] = lapHistory[i + 1];
+          }
+          lapHistory[MAX_STORED_LAPS - 1] = currentLapSeconds;
+        }
+
+        // 5 rapid buzzer bursts
+        playFinishBeeps();
+        events.send("rapid_finish", "web_beep", currentMillis);
+        broadcastLapsJSON();
+
+        // Lock in completion display for 10 seconds
+        stateTimerMillis = currentMillis;
+        currentState = STATE_LAP_FINISHED;
+      }
+      break;
     }
-    // Bar meter for Sonar (0-150 cm range)
-    display.drawRect(0, 26, 128, 5, WHITE);
-    int sonarBar = constrain(map(sonarDist, 0, 150, 0, 126), 0, 126);
-    if (sonarDist > 0) display.fillRect(1, 27, sonarBar, 3, WHITE);
 
-    // Row 2: ToF Reading & Progress Bar
-    display.setCursor(0, 36);
-    display.print("ToF:   ");
-    if (tofReady) {
-      display.print(tofDist);
-      display.print(" cm (");
-      display.print(isVL53L1X ? "L1X" : "L0X");
-      display.print(")");
-    } else {
-      display.print("OFFLINE");
-    }
-    // Bar meter for ToF (0-150 cm range)
-    display.drawRect(0, 47, 128, 5, WHITE);
-    int tofBar = constrain(map(tofDist, 0, 150, 0, 126), 0, 126);
-    if (tofReady && tofDist > 0) display.fillRect(1, 48, tofBar, 3, WHITE);
+    // ----------------------------------------------------
+    // 6. FINISH SCREEN (PAUSES FOR EXACTLY 10 SECONDS)
+    // ----------------------------------------------------
+    case STATE_LAP_FINISHED: {
+      digitalWrite(GREEN_LED, HIGH);
+      digitalWrite(RED_LED, LOW);
 
-    // Bottom Status Banner
-    if (objectDetected) {
-      display.fillRect(0, 56, 128, 8, WHITE);
-      display.setTextColor(BLACK);
-      display.setCursor(14, 56);
-      display.print(">>> DETECTED <<<");
-      display.setTextColor(WHITE);
+      unsigned long elapsed = currentMillis - stateTimerMillis;
+      int remainingSec = 10 - (elapsed / 1000);
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.print("LAP COMPLETED!");
+      display.setCursor(95, 0);
+      display.printf("[%ds]", max(0, remainingSec));
+      display.drawLine(0, 10, 127, 10, WHITE);
+
+      display.setTextSize(3);
+      display.setCursor(0, 20);
+      display.printf("%05.2f", currentLapSeconds);
+      display.setTextSize(1);
+      display.setCursor(100, 34);
+      display.print("sec");
+
+      display.setCursor(0, 52);
+      display.print("Returning to Home...");
+      display.display();
+
+      char finalStr[16];
+      snprintf(finalStr, sizeof(finalStr), "%.3f s", currentLapSeconds);
+      events.send(finalStr, "timer", currentMillis);
+      events.send("LAP FINISHED", "status", currentMillis);
+
+      // Return to Standby Menu after 10 seconds
+      if (elapsed >= 10000) {
+        currentState = STATE_STANDBY;
+      }
+      break;
     }
   }
 
-  display.display(); 
-  delay(30);         
+  delay(20);
 }
