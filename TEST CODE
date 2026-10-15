@@ -1,1 +1,230 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <NewPing.h>
+#include <VL53L1X.h>
+#include <VL53L0X.h>
 
+// --- PIN DEFINITIONS ---
+#define TOUCH_PIN    4
+#define TRIG_PIN     5
+#define ECHO_PIN     18
+#define RED_LED      14
+#define GREEN_LED    27
+#define BUZZER_PIN   19
+
+#define TOF_SDA      32
+#define TOF_SCL      33
+#define TOF_XSHUT    26
+#define MAX_DIST_CM  200
+
+// --- HARDWARE OBJECTS ---
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DIST_CM);
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+VL53L1X tof1;
+VL53L0X tof0;
+
+// --- STATE VARIABLES ---
+bool systemEnabled = false;
+unsigned long touchHoldStart = 0;
+bool isVL53L1X = false;
+bool isVL53L0X = false;
+bool tofReady = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // 1. Hardware Reset: Hold XSHUT low to prevent bus lockup
+  pinMode(TOF_XSHUT, OUTPUT);
+  digitalWrite(TOF_XSHUT, LOW);
+
+  // 2. Initialize OLED on Primary I2C (Pins 21/22)
+  Wire.begin(21, 22);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3D);
+  display.setTextColor(WHITE);
+  display.clearDisplay();
+  
+  display.setTextSize(2);
+  display.setCursor(15, 10);
+  display.print("BRAVO X1");
+  display.setTextSize(1);
+  display.setCursor(18, 40);
+  display.print("Initializing...");
+  display.display();
+
+  // 3. Hardware Wakeup: Release ToF Reset
+  delay(100);
+  digitalWrite(TOF_XSHUT, HIGH);
+  delay(150);
+
+  // 4. Initialize Secondary I2C (Pins 32/33)
+  Wire1.begin(TOF_SDA, TOF_SCL, 400000);
+
+  // 5. Autodetect Sensor Protocol
+  tof1.setBus(&Wire1);
+  tof1.setTimeout(500);
+  if (tof1.init()) {
+    isVL53L1X = true;
+    tofReady = true;
+    tof1.setDistanceMode(VL53L1X::Long);
+    tof1.setMeasurementTimingBudget(33000);
+    tof1.startContinuous(33);
+  } else {
+    tof0.setBus(&Wire1);
+    tof0.setTimeout(500);
+    if (tof0.init()) {
+      isVL53L0X = true;
+      tofReady = true;
+      tof0.startContinuous();
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(10, 25);
+  if (isVL53L1X) {
+    display.print("Detected: VL53L1X");
+  } else if (isVL53L0X) {
+    display.print("Detected: VL53L0X");
+  } else {
+    display.print("ToF Not Detected!");
+  }
+  display.display();
+  delay(1500);
+}
+
+void loop() {
+  // --- 1. TOUCH SENSOR LOGIC (2-Sec Hold) ---
+  if (digitalRead(TOUCH_PIN) == HIGH) {
+    if (touchHoldStart == 0) {
+      touchHoldStart = millis(); 
+    } else if (millis() - touchHoldStart >= 2000) {
+      systemEnabled = !systemEnabled; 
+      touchHoldStart = 0; 
+      
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(15, 25);
+      display.print(systemEnabled ? "ENABLED!" : "DISABLED");
+      display.display();
+      
+      tone(BUZZER_PIN, systemEnabled ? 2000 : 800, 300); 
+      delay(1500); 
+    }
+  } else {
+    touchHoldStart = 0; 
+  }
+
+  display.clearDisplay();
+
+  // --- 2. STANDBY SCREEN ---
+  if (!systemEnabled) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    noTone(BUZZER_PIN);
+
+    // Drain data buffers so I2C does not freeze
+    if (isVL53L1X && tof1.dataReady()) { tof1.read(); }
+    if (isVL53L0X) { tof0.readRangeContinuousMillimeters(); }
+
+    display.setTextSize(2);
+    display.setCursor(20, 10);
+    display.print("STANDBY");
+    
+    display.setTextSize(1);
+    display.setCursor(15, 35);
+    display.print("Hold Touch 2 Sec");
+    
+    if (touchHoldStart > 0) {
+      int barWidth = map(millis() - touchHoldStart, 0, 2000, 0, 128);
+      display.fillRect(0, 50, barWidth, 10, WHITE);
+    }
+  } 
+  // --- 3. ACTIVE TELEMETRY SCREEN ---
+  else {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    
+    // Acquire Sonar Distance
+    unsigned int sonarDist = sonar.ping_cm();
+    
+    // Acquire ToF Distance
+    unsigned int tofDist = 0;
+    if (isVL53L1X) {
+      if (tof1.dataReady()) {
+        tofDist = tof1.read() / 10; // Convert mm to cm
+      }
+    } else if (isVL53L0X) {
+      tofDist = tof0.readRangeContinuousMillimeters() / 10;
+    }
+
+    // Proximity trigger (under 10 cm)
+    bool objectDetected = ((sonarDist > 0 && sonarDist <= 10) || (tofDist > 0 && tofDist <= 10));
+
+    if (objectDetected) {
+      tone(BUZZER_PIN, 2500); 
+      digitalWrite(RED_LED, HIGH);
+      digitalWrite(GREEN_LED, LOW);
+    } else {
+      noTone(BUZZER_PIN); 
+      digitalWrite(RED_LED, LOW);
+      digitalWrite(GREEN_LED, HIGH);
+    }
+
+    // --- DISPLAY LAYOUT ---
+    // Header
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("BRAVO X1");
+    display.setCursor(80, 0);
+    display.print(objectDetected ? "[ALERT]" : "[OK]");
+    display.drawLine(0, 10, 127, 10, WHITE);
+
+    // Row 1: Ultrasonic Reading & Progress Bar
+    display.setCursor(0, 15);
+    display.print("SONAR: ");
+    if (sonarDist > 0) {
+      display.print(sonarDist);
+      display.print(" cm");
+    } else {
+      display.print("-- (Out)");
+    }
+    // Bar meter for Sonar (0-150 cm range)
+    display.drawRect(0, 26, 128, 5, WHITE);
+    int sonarBar = constrain(map(sonarDist, 0, 150, 0, 126), 0, 126);
+    if (sonarDist > 0) display.fillRect(1, 27, sonarBar, 3, WHITE);
+
+    // Row 2: ToF Reading & Progress Bar
+    display.setCursor(0, 36);
+    display.print("ToF:   ");
+    if (tofReady) {
+      display.print(tofDist);
+      display.print(" cm (");
+      display.print(isVL53L1X ? "L1X" : "L0X");
+      display.print(")");
+    } else {
+      display.print("OFFLINE");
+    }
+    // Bar meter for ToF (0-150 cm range)
+    display.drawRect(0, 47, 128, 5, WHITE);
+    int tofBar = constrain(map(tofDist, 0, 150, 0, 126), 0, 126);
+    if (tofReady && tofDist > 0) display.fillRect(1, 48, tofBar, 3, WHITE);
+
+    // Bottom Status Banner
+    if (objectDetected) {
+      display.fillRect(0, 56, 128, 8, WHITE);
+      display.setTextColor(BLACK);
+      display.setCursor(14, 56);
+      display.print(">>> DETECTED <<<");
+      display.setTextColor(WHITE);
+    }
+  }
+
+  display.display(); 
+  delay(30);         
+}
